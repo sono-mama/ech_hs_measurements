@@ -1,0 +1,4 @@
+{"fqdn":"dns.coffee","ech_b64":"AEX+DQBBdwAgACCctLyUTF1O2durVW9Np0e4AZ6mdLMhKaxOaQoFDRLCEwAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA=","ipv4":["104.21.57.149","172.67.146.166"],"ipv6":["2606:4700:3032::6815:3995","2606:4700:3036::ac43:92a6"],"ttl_unix":1751797832}
+{"fqdn":"slashlib.me","ech_b64":"AEX+DQBBdwAgACCctLyUTF1O2durVW9Np0e4AZ6mdLMhKaxOaQoFDRLCEwAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA=","ipv4":["104.26.6.124","104.26.7.124","172.67.69.137"],"ipv6":["2606:4700:20::681a:67c","2606:4700:20::681a:77c","2606:4700:20::ac43:4589"],"ttl_unix":1751797957}
+{"fqdn":"cloudflare.com","ipv4":["104.16.132.229","104.16.133.229"],"ipv6":["2606:4700::6810:85e5","2606:4700::6810:84e5"]}
+{"fqdn":"facebook.com","ipv4":["57.144.112.1"],"ipv6":["2a03:2880:f189:80:face:b00c:0:25de"]}
