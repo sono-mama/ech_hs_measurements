@@ -6,9 +6,11 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"os"
 	"strings"
@@ -38,10 +40,11 @@ var (
 /* ------------------------------------------------------------------ */
 
 type DNSLine struct {
-	FQDN   string
-	ECHB64 string
-	IPv4   []string
-	IPv6   []string
+	FQDN       string
+	ECHB64     string
+	IPv4       []string
+	IPv6       []string
+	TargetFQDN string // HTTPS/SVCB TargetName (may equal FQDN)
 }
 
 type ProbeLine struct {
@@ -60,38 +63,62 @@ type ProbeLine struct {
 
 var (
 	/* I/O */
-	inFile  = flag.String("in", "-", "domain list ( - = stdin )")
+	inFile  = flag.String("in", "-", "domain list ( - = stdin ) or unused when -ck-source-query is set")
 	outFile = flag.String("out", "-", "probe JSONL file ( - = stdout )")
 
 	/* DNS */
-	resolver   = flag.String("dns", "8.8.8.8:53", "upstream DNS server")
-	dnsTO      = flag.Duration("dns-timeout", 3*time.Second, "DNS query timeout")
-	dnsWorkers = flag.Int("dns-workers", 512, "parallel DNS goroutines")
+	resolver    = flag.String("dns", "8.8.8.8:53", "upstream DNS server")
+	dnsTO       = flag.Duration("dns-timeout", 3*time.Second, "DNS query timeout")
+	dnsWorkers  = flag.Int("dns-workers", 512, "parallel DNS goroutines")
+	emitDNSMiss = flag.Bool("emit-dns-miss", true, "emit a synthetic row when no IPv4 targets are found")
 
 	/* TLS */
-	hsTO        = flag.Duration("handshakeTO", 7*time.Second, "TLS handshake timeout")
+	dialTO      = flag.Duration("dial-timeout", 2*time.Second, "TCP dial timeout")
+	hsTO        = flag.Duration("handshake-timeout", 4*time.Second, "TLS handshake timeout")
 	tlsWorkers  = flag.Int("tls-workers", 512, "parallel TLS goroutines")
-	enableRetry = flag.Bool("retry", true, "retry once on ECHRejectionError")
-	disableV6   = flag.Bool("disable-ipv6", false, "skip IPv6 addresses")
+	perIPLimit  = flag.Int("per-ip-limit", 64, "max concurrent dials to the same IP")
+	enableRetry = flag.Bool("retry", true, "retry once on ECHRejectionError (server-provided RetryConfig)")
+	disableV6   = flag.Bool("disable-ipv6", false, "skip IPv6 addresses for probing")
 
 	/* ClickHouse sink & source */
 	ckDSN      = flag.String("ck-dsn", "", "ClickHouse DSN")
+	ckTable    = flag.String("ck-table", "ech.handshakes", "ClickHouse target table")
 	ckBatch    = flag.Int("ck-batch", 50000, "rows per ClickHouse INSERT")
 	ckPeriod   = flag.Duration("ck-period", 2*time.Second, "flush period for partial batch")
-	ckSrcQuery = flag.String("ck-source-query", "", "SQL returning column 'fqdn' to feed scanner")
+	ckSrcQuery = flag.String("ck-source-query", "", "SQL returning column 'fqdn' (name) to feed scanner")
+	runDateStr = flag.String("run-date", "", "run_date to stamp rows (YYYY-MM-DD). Default: today()")
+)
+
+/* ------------------------------------------------------------------ */
+/* Globals                                                             */
+/* ------------------------------------------------------------------ */
+
+var (
+	ckConnGlobal clickhouse.Conn
+	runDateVal   time.Time
+	ipLimiter    *perIPLimiter
 )
 
 /* ------------------------------------------------------------------ */
 
 func main() {
 	flag.Parse()
+	rand.Seed(time.Now().UnixNano())
+
+	/* ---------- run_date ---------- */
+	if *runDateStr != "" {
+		t, err := time.Parse("2006-01-02", *runDateStr)
+		must(err)
+		runDateVal = t
+	} else {
+		runDateVal = time.Now().UTC()
+	}
 
 	/* ---------- ClickHouse connection (optional) ---------- */
-	var ckConn clickhouse.Conn
 	if *ckDSN != "" {
 		opts, err := clickhouse.ParseDSN(*ckDSN)
 		must(err)
-		ckConn, err = clickhouse.Open(opts)
+		ckConnGlobal, err = clickhouse.Open(opts)
 		must(err)
 	}
 
@@ -105,7 +132,10 @@ func main() {
 
 	/* ---------- writer ---------- */
 	writerWG.Add(1)
-	go writer(results, ckConn, &writerWG)
+	go writer(results, &writerWG)
+
+	/* ---------- per-IP limiter ---------- */
+	ipLimiter = newPerIPLimiter(*perIPLimit)
 
 	/* ---------- TLS workers ---------- */
 	tlsWG.Add(*tlsWorkers)
@@ -128,6 +158,18 @@ func main() {
 				if d, ok := resolveDomain(dom); ok {
 					tlsJobs <- d
 				} else {
+					// No DNS record at all; optionally emit a synthetic miss row
+					if *emitDNSMiss {
+						results <- ProbeLine{
+							FQDN:         dom,
+							IP:           "0.0.0.0",
+							ConnMs:       0,
+							ECHAttempted: false,
+							ECHAccepted:  false,
+							RetryUsed:    false,
+							Error:        "dns:lookup_failed",
+						}
+					}
 					atomic.AddUint64(&dnsDone, 1) // skipped
 				}
 			}
@@ -136,10 +178,10 @@ func main() {
 
 	/* ---------- domain producer ---------- */
 	if *ckSrcQuery != "" {
-		if ckConn == nil {
+		if ckConnGlobal == nil {
 			log.Fatal("-ck-source-query requires -ck-dsn")
 		}
-		streamDomainsFromClickHouse(ckConn, *ckSrcQuery, dnsJobs)
+		streamDomainsFromClickHouse(ckConnGlobal, *ckSrcQuery, dnsJobs)
 	} else {
 		streamDomainsFromFile(*inFile, dnsJobs)
 	}
@@ -159,8 +201,10 @@ func main() {
 
 func streamDomainsFromFile(path string, out chan<- string) {
 	defer close(out)
-	r := os.Stdin
-	if path != "-" {
+	var r *os.File
+	if path == "-" {
+		r = os.Stdin
+	} else {
 		f, err := os.Open(path)
 		must(err)
 		defer f.Close()
@@ -186,29 +230,37 @@ func streamDomainsFromClickHouse(conn clickhouse.Conn, query string, out chan<- 
 		defer close(out)
 		for rows.Next() {
 			var fqdn string
-			rows.Scan(&fqdn)
-			out <- fqdn
-			atomic.AddUint64(&totalDomains, 1)
+			_ = rows.Scan(&fqdn)
+			if fqdn != "" {
+				out <- fqdn
+				atomic.AddUint64(&totalDomains, 1)
+			}
 		}
 	}()
 }
 
 /* ====================== Writer ====================== */
 
-func writer(results <-chan ProbeLine, ckConn clickhouse.Conn, wg *sync.WaitGroup) {
+func writer(results <-chan ProbeLine, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	/* JSON sink (optional) */
+	/* JSON sink */
 	var (
 		jsonEnabled bool
 		enc         *json.Encoder
 		bw          *bufio.Writer
 	)
-	if *outFile != "-" {
+	{
 		jsonEnabled = true
-		f, err := os.Create(*outFile)
-		must(err)
-		bw = bufio.NewWriterSize(f, 1<<20)
+		var w *os.File
+		if *outFile == "-" {
+			w = os.Stdout
+		} else {
+			f, err := os.Create(*outFile)
+			must(err)
+			w = f
+		}
+		bw = bufio.NewWriterSize(w, 1<<20)
 		enc = json.NewEncoder(bw)
 	}
 
@@ -217,8 +269,8 @@ func writer(results <-chan ProbeLine, ckConn clickhouse.Conn, wg *sync.WaitGroup
 	timer := time.NewTimer(*ckPeriod)
 
 	flushCK := func() {
-		if ckConn != nil && len(batch) > 0 {
-			sendBatch(ckConn, batch)
+		if ckConnGlobal != nil && len(batch) > 0 {
+			sendBatch(batch)
 			batch = batch[:0]
 		}
 		timer.Reset(*ckPeriod)
@@ -240,7 +292,7 @@ func writer(results <-chan ProbeLine, ckConn clickhouse.Conn, wg *sync.WaitGroup
 			if jsonEnabled {
 				_ = enc.Encode(p)
 			}
-			if ckConn != nil {
+			if ckConnGlobal != nil {
 				batch = append(batch, p)
 				if len(batch) >= *ckBatch {
 					flushCK()
@@ -264,15 +316,16 @@ func writer(results <-chan ProbeLine, ckConn clickhouse.Conn, wg *sync.WaitGroup
 	}
 }
 
-/* ====================== DNS stage ====================== */
+/* ====================== DNS helpers ====================== */
 
 func resolveDomain(domain string) (DNSLine, bool) {
-	c := &dns.Client{Timeout: *dnsTO}
-	msg := new(dns.Msg)
-	msg.SetQuestion(dns.Fqdn(domain), dns.TypeHTTPS)
+	domainFQDN := dns.Fqdn(domain)
 
-	r, _, err := c.Exchange(msg, *resolver)
-	if err == nil && len(r.Answer) > 0 {
+	cli := &dns.Client{Timeout: *dnsTO}
+	// 1) Ask for HTTPS (SVCB) first
+	httpsMsg := new(dns.Msg)
+	httpsMsg.SetQuestion(domainFQDN, dns.TypeHTTPS)
+	if r, _, err := cli.Exchange(httpsMsg, *resolver); err == nil && len(r.Answer) > 0 {
 		for _, rr := range r.Answer {
 			if h, ok := rr.(*dns.HTTPS); ok {
 				var ech []byte
@@ -291,32 +344,102 @@ func resolveDomain(domain string) (DNSLine, bool) {
 						}
 					}
 				}
+
+				// If no IPv4 hints, try A(TargetName). If still none, A(original)
+				target := strings.TrimSuffix(h.Target, ".")
+				if target == "" || target == "." {
+					target = domain
+				}
+				if len(v4) == 0 {
+					v4 = append(v4, dnsLookupA(cli, target)...)
+					if len(v4) == 0 && target != domain {
+						v4 = append(v4, dnsLookupA(cli, domain)...)
+					}
+				}
+				// (IPv6 available if not disabled)
+				if !*disableV6 && len(v6) == 0 {
+					v6 = append(v6, dnsLookupAAAA(cli, target)...)
+					if len(v6) == 0 && target != domain {
+						v6 = append(v6, dnsLookupAAAA(cli, domain)...)
+					}
+				}
+
 				return DNSLine{
-					FQDN:   domain,
-					ECHB64: base64.StdEncoding.EncodeToString(ech),
-					IPv4:   v4,
-					IPv6:   v6,
+					FQDN:       domain,
+					ECHB64:     base64.StdEncoding.EncodeToString(ech),
+					IPv4:       dedup(v4),
+					IPv6:       dedup(v6),
+					TargetFQDN: target,
 				}, true
 			}
 		}
 	}
 
-	var rslv net.Resolver
-	ctx, cancel := context.WithTimeout(context.Background(), *dnsTO)
-	defer cancel()
-	v4, _ := rslv.LookupIP(ctx, "ip4", domain)
-	v6, _ := rslv.LookupIP(ctx, "ip6", domain)
+	// 2) No HTTPS answer → fallback A/AAAA on original name
+	cli.Timeout = *dnsTO
+	v4 := dnsLookupA(cli, domain)
+	var v6 []string
+	if !*disableV6 {
+		v6 = dnsLookupAAAA(cli, domain)
+	}
+
 	if len(v4)+len(v6) == 0 {
 		return DNSLine{}, false
 	}
-	out := DNSLine{FQDN: domain}
-	for _, ip := range v4 {
-		out.IPv4 = append(out.IPv4, ip.String())
+	return DNSLine{
+		FQDN:       domain,
+		ECHB64:     "",
+		IPv4:       dedup(v4),
+		IPv6:       dedup(v6),
+		TargetFQDN: domain,
+	}, true
+}
+
+func dnsLookupA(cli *dns.Client, name string) []string {
+	msg := new(dns.Msg)
+	msg.SetQuestion(dns.Fqdn(name), dns.TypeA)
+	r, _, err := cli.Exchange(msg, *resolver)
+	if err != nil || len(r.Answer) == 0 {
+		return nil
 	}
-	for _, ip := range v6 {
-		out.IPv6 = append(out.IPv6, ip.String())
+	out := make([]string, 0, len(r.Answer))
+	for _, rr := range r.Answer {
+		if a, ok := rr.(*dns.A); ok {
+			out = append(out, a.A.String())
+		}
 	}
-	return out, true
+	return out
+}
+
+func dnsLookupAAAA(cli *dns.Client, name string) []string {
+	msg := new(dns.Msg)
+	msg.SetQuestion(dns.Fqdn(name), dns.TypeAAAA)
+	r, _, err := cli.Exchange(msg, *resolver)
+	if err != nil || len(r.Answer) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(r.Answer))
+	for _, rr := range r.Answer {
+		if a, ok := rr.(*dns.AAAA); ok {
+			out = append(out, a.AAAA.String())
+		}
+	}
+	return out
+}
+
+func dedup(in []string) []string {
+	if len(in) < 2 {
+		return in
+	}
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if _, ok := seen[s]; !ok {
+			seen[s] = struct{}{}
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 /* ====================== TLS stage ====================== */
@@ -327,6 +450,20 @@ func runProbes(d DNSLine, out chan<- ProbeLine) {
 	targets := append([]string{}, d.IPv4...)
 	if !*disableV6 {
 		targets = append(targets, d.IPv6...)
+	}
+	if len(targets) == 0 {
+		if *emitDNSMiss {
+			out <- ProbeLine{
+				FQDN:         d.FQDN,
+				IP:           "0.0.0.0",
+				ConnMs:       0,
+				ECHAttempted: false,
+				ECHAccepted:  false,
+				RetryUsed:    false,
+				Error:        "dns:no_ipv4_targets",
+			}
+		}
+		return
 	}
 	for _, ip := range targets {
 		out <- probeOne(d.FQDN, ip, echBytes)
@@ -340,31 +477,36 @@ func probeOne(fqdn, ip string, echCfg []byte) ProbeLine {
 		ECHAttempted: len(echCfg) > 0,
 	}
 
+	ipLimiter.acquire(ip)
+	defer ipLimiter.release(ip)
+
+	// --- Attempt 1: dial + handshake
 	cfg := tlsConfig(fqdn, echCfg)
 	start := time.Now()
-	conn, err := dialTLS(ip, cfg)
+	conn, err := dialAndHandshake(ip, cfg)
 	pl.ConnMs = uint32(time.Since(start).Milliseconds())
-
 	if err == nil {
 		pl.ECHAccepted = conn.ConnectionState().ECHAccepted
-		conn.Close()
+		_ = conn.Close()
 		return pl
 	}
 
+	// If not an ECH rejection (or retry disabled), return error
 	echErr, ok := err.(*tls.ECHRejectionError)
 	if !ok || !*enableRetry || len(echErr.RetryConfigList) == 0 {
 		pl.Error = err.Error()
 		return pl
 	}
 
+	// --- Attempt 2: retry with RetryConfigList
 	pl.RetryUsed = true
 	cfg2 := tlsConfig(fqdn, echErr.RetryConfigList)
 	start = time.Now()
-	conn2, err2 := dialTLS(ip, cfg2)
+	conn2, err2 := dialAndHandshake(ip, cfg2)
 	pl.ConnMs = uint32(time.Since(start).Milliseconds())
 	if err2 == nil {
 		pl.ECHAccepted = conn2.ConnectionState().ECHAccepted
-		conn2.Close()
+		_ = conn2.Close()
 	} else {
 		pl.Error = err2.Error()
 	}
@@ -380,27 +522,65 @@ func tlsConfig(server string, ech []byte) *tls.Config {
 	}
 }
 
-func dialTLS(ip string, cfg *tls.Config) (*tls.Conn, error) {
-	d := &net.Dialer{Timeout: *hsTO}
-	return tls.DialWithDialer(d, "tcp", net.JoinHostPort(ip, "443"), cfg)
+func dialAndHandshake(ip string, cfg *tls.Config) (*tls.Conn, error) {
+	// TCP dial with its own timeout
+	ctx, cancel := context.WithTimeout(context.Background(), *dialTO)
+	defer cancel()
+
+	d := &net.Dialer{}
+	tcpConn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(ip, "443"))
+	if err != nil {
+		return nil, err
+	}
+
+	// Handshake with deadline
+	_ = tcpConn.SetDeadline(time.Now().Add(*hsTO))
+	tlsConn := tls.Client(tcpConn, cfg)
+	if err := tlsConn.Handshake(); err != nil {
+		_ = tlsConn.Close()
+		return nil, err
+	}
+	// clear deadlines
+	_ = tlsConn.SetDeadline(time.Time{})
+	return tlsConn, nil
+}
+
+func isTimeoutErr(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout() || strings.Contains(strings.ToLower(err.Error()), "timeout")
 }
 
 /* ====================== ClickHouse sink ====================== */
 
-func sendBatch(conn clickhouse.Conn, rows []ProbeLine) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+func sendBatch(rows []ProbeLine) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	b, err := conn.PrepareBatch(ctx, "INSERT INTO ech.results")
+
+	stmt := fmt.Sprintf(`
+	  INSERT INTO %s
+	      (run_date, ts, fqdn, ip, conn_ms, ech_attempted, ech_accepted, retry_used, error)
+	`, *ckTable)
+
+	b, err := ckConnGlobal.PrepareBatch(ctx, stmt)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "ck prepare:", err)
 		return
 	}
 	for _, r := range rows {
+		var ipAddr net.IP
+		if r.IP != "" {
+			ipAddr = net.ParseIP(r.IP)
+			if ipAddr == nil {
+				// allow "0.0.0.0" synthetic to parse
+				ipAddr = net.ParseIP("0.0.0.0")
+			}
+		}
 		err = b.Append(
-			time.Now(),
-			r.FQDN,
-			net.ParseIP(r.IP),
-			r.ConnMs,
+			runDateVal,       // run_date (Date)
+			time.Now().UTC(), // ts
+			r.FQDN,           // fqdn
+			ipAddr,           // ip (IPv6)
+			r.ConnMs,         // conn_ms
 			boolToUInt8(r.ECHAttempted),
 			boolToUInt8(r.ECHAccepted),
 			boolToUInt8(r.RetryUsed),
@@ -448,11 +628,46 @@ func heartbeat() {
 			"[%.8s] dns:%d/%d tls:%d/%d ok:%d tried:%d err:%d rate:%.0f/s eta:%s\n",
 			time.Now().Format(time.RFC3339),
 			dd, td, hd, td, ok, at, er, rate, eta)
+	}
+}
 
-		// if hd >= td && td > 0 {
-		// 	ticker.Stop()
-		// 	return
-		// }
+/* ------------------------------------------------------------------ */
+/* Per-IP concurrency limiter                                          */
+/* ------------------------------------------------------------------ */
+
+type perIPLimiter struct {
+	mu  sync.Mutex
+	m   map[string]chan struct{}
+	cap int
+}
+
+func newPerIPLimiter(cap int) *perIPLimiter {
+	if cap <= 0 {
+		cap = 1
+	}
+	return &perIPLimiter{
+		m:   make(map[string]chan struct{}),
+		cap: cap,
+	}
+}
+
+func (l *perIPLimiter) acquire(ip string) {
+	l.mu.Lock()
+	ch, ok := l.m[ip]
+	if !ok {
+		ch = make(chan struct{}, l.cap)
+		l.m[ip] = ch
+	}
+	l.mu.Unlock()
+	ch <- struct{}{}
+}
+
+func (l *perIPLimiter) release(ip string) {
+	l.mu.Lock()
+	ch := l.m[ip]
+	l.mu.Unlock()
+	if ch != nil {
+		<-ch
 	}
 }
 
